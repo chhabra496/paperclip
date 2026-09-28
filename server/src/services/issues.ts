@@ -233,6 +233,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const ISSUE_COMMENT_RUN_LOG_PERSIST_RETRY_DELAYS_MS = [250, 1_000, 5_000] as const;
 const ISSUE_COMMENT_RUN_LOG_POST_MARKER =
   /comment id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/gi;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
@@ -7023,7 +7024,10 @@ export function issueService(db: Db) {
     });
   }
 
-  async function persistRunLogCommentAttribution(runId: string) {
+  async function persistRunLogCommentAttribution(
+    runId: string,
+    retryAttempt = 0,
+  ) {
     const run = await db
       .select({
         runId: heartbeatRuns.id,
@@ -7070,7 +7074,6 @@ export function issueService(db: Db) {
       .where(
         and(
           eq(issueComments.companyId, run.companyId),
-          eq(issueComments.issueId, issueId),
           inArray(issueComments.id, markedCommentIds),
           isNull(issueComments.authorAgentId),
           isNull(issueComments.createdByRunId),
@@ -7088,7 +7091,7 @@ export function issueService(db: Db) {
                   eq(activityLog.runId, run.runId),
                   eq(activityLog.action, "issue.comment_added"),
                   eq(activityLog.entityType, "issue"),
-                  eq(activityLog.entityId, issueId),
+                  sql`${activityLog.entityId} = ${issueComments.issueId}::text`,
                   sql`${activityLog.details} ->> 'commentId' = ${issueComments.id}::text`,
                 ),
               ),
@@ -7126,7 +7129,7 @@ export function issueService(db: Db) {
       .map((comment) => comment.id);
     if (eligibleCommentIds.length === 0) return 0;
 
-    return db.transaction(async (tx) => {
+    const updatedCount = await db.transaction(async (tx) => {
       const unlockedCommentIds = await tx
         .select({ id: issueComments.id })
         .from(issueComments)
@@ -7153,6 +7156,31 @@ export function issueService(db: Db) {
         .returning({ id: issueComments.id })
         .then((rows) => rows.length);
     });
+    if (updatedCount < eligibleCommentIds.length) {
+      const retryDelay = ISSUE_COMMENT_RUN_LOG_PERSIST_RETRY_DELAYS_MS[retryAttempt];
+      if (retryDelay !== undefined) {
+        const retryTimer = setTimeout(() => {
+          void persistRunLogCommentAttribution(runId, retryAttempt + 1).catch(
+            (err) => {
+              logger.warn(
+                { err, runId, retryAttempt: retryAttempt + 1 },
+                "failed to retry run-log comment attribution persistence",
+              );
+            },
+          );
+        }, retryDelay);
+        retryTimer.unref?.();
+      } else {
+        logger.warn(
+          {
+            runId,
+            skippedCommentCount: eligibleCommentIds.length - updatedCount,
+          },
+          "run-log comment attribution remained locked after bounded retries",
+        );
+      }
+    }
+    return updatedCount;
   }
 
   async function isTreeHoldInteractionCheckoutAllowed(

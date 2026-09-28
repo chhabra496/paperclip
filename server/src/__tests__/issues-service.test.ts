@@ -2713,6 +2713,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   async function seedRunLogAttributionFixture(options?: {
     commentOnDifferentIssue?: boolean;
     directCreatedByRunId?: boolean;
+    omitActivityProvenance?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -2806,18 +2807,20 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       createdAt: new Date("2026-05-12T23:00:00.000Z"),
       updatedAt: new Date("2026-05-12T23:00:00.000Z"),
     });
-    await db.insert(activityLog).values({
-      companyId,
-      actorType: "agent",
-      actorId: agentId,
-      agentId,
-      runId,
-      action: "issue.comment_added",
-      entityType: "issue",
-      entityId: commentIssueId,
-      details: { commentId },
-      createdAt: new Date("2026-05-12T23:00:01.000Z"),
-    });
+    if (!options?.omitActivityProvenance) {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: commentIssueId,
+        details: { commentId },
+        createdAt: new Date("2026-05-12T23:00:01.000Z"),
+      });
+    }
 
     return { companyId, agentId, issueId, commentIssueId, commentId, runId };
   }
@@ -2849,17 +2852,24 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       await lockPromise;
     }
 
-    await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(1);
-
-    const stored = await db
-      .select({
-        derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
-        derivedCreatedByRunId: issueComments.derivedCreatedByRunId,
-        derivedAuthorSource: issueComments.derivedAuthorSource,
-      })
-      .from(issueComments)
-      .where(eq(issueComments.id, commentId))
-      .then((rows) => rows[0] ?? null);
+    let stored: {
+      derivedAuthorAgentId: string | null;
+      derivedCreatedByRunId: string | null;
+      derivedAuthorSource: string | null;
+    } | null = null;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      stored = await db
+        .select({
+          derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+          derivedCreatedByRunId: issueComments.derivedCreatedByRunId,
+          derivedAuthorSource: issueComments.derivedAuthorSource,
+        })
+        .from(issueComments)
+        .where(eq(issueComments.id, commentId))
+        .then((rows) => rows[0] ?? null);
+      if (stored?.derivedAuthorAgentId) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     expect(stored).toEqual({
       derivedAuthorAgentId: agentId,
       derivedCreatedByRunId: runId,
@@ -2867,9 +2877,24 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
-  it("does not persist a run-log marker for a comment on another issue", async () => {
+  it("persists an activity-proven run-log marker for a comment on another issue", async () => {
     const { commentId, runId } = await seedRunLogAttributionFixture({
       commentOnDifferentIssue: true,
+    });
+
+    await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(1);
+    const stored = await db
+      .select({ derivedAuthorAgentId: issueComments.derivedAuthorAgentId })
+      .from(issueComments)
+      .where(eq(issueComments.id, commentId))
+      .then((rows) => rows[0] ?? null);
+    expect(stored?.derivedAuthorAgentId).not.toBeNull();
+  });
+
+  it("does not persist a cross-issue log marker without activity provenance", async () => {
+    const { commentId, runId } = await seedRunLogAttributionFixture({
+      commentOnDifferentIssue: true,
+      omitActivityProvenance: true,
     });
 
     await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(0);
