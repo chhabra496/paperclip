@@ -2710,12 +2710,19 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     }
   });
 
-  it("persists run-log-only attribution after run finalization", async () => {
+  async function seedRunLogAttributionFixture(options?: {
+    commentOnDifferentIssue?: boolean;
+    directCreatedByRunId?: boolean;
+  }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
+    const commentIssueId = options?.commentOnDifferentIssue
+      ? randomUUID()
+      : issueId;
     const commentId = randomUUID();
     const runId = randomUUID();
+    const directRunId = options?.directCreatedByRunId ? randomUUID() : null;
 
     await db.insert(companies).values({
       id: companyId,
@@ -2734,13 +2741,26 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Run-log attribution issue",
-      status: "todo",
-      priority: "medium",
-    });
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Run-log attribution issue",
+        status: "todo",
+        priority: "medium",
+      },
+      ...(commentIssueId === issueId
+        ? []
+        : [
+            {
+              id: commentIssueId,
+              companyId,
+              title: "Other issue",
+              status: "todo" as const,
+              priority: "medium" as const,
+            },
+          ]),
+    ]);
 
     const runLogStore = getRunLogStore();
     const logHandle = await runLogStore.begin({ companyId, agentId, runId });
@@ -2764,15 +2784,70 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       logRef: logHandle.logRef,
       logBytes: logSummary.bytes,
     });
+    if (directRunId) {
+      await db.insert(heartbeatRuns).values({
+        id: directRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        contextSnapshot: { issueId: commentIssueId },
+        createdAt: new Date("2026-05-12T22:59:00.000Z"),
+        startedAt: new Date("2026-05-12T22:59:00.000Z"),
+        finishedAt: new Date("2026-05-12T23:01:00.000Z"),
+      });
+    }
     await db.insert(issueComments).values({
       id: commentId,
       companyId,
-      issueId,
+      issueId: commentIssueId,
       authorUserId: "local-board",
+      createdByRunId: directRunId,
       body: "Legacy agent comment",
       createdAt: new Date("2026-05-12T23:00:00.000Z"),
       updatedAt: new Date("2026-05-12T23:00:00.000Z"),
     });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: commentIssueId,
+      details: { commentId },
+      createdAt: new Date("2026-05-12T23:00:01.000Z"),
+    });
+
+    return { companyId, agentId, issueId, commentIssueId, commentId, runId };
+  }
+
+  it("persists run-log-only attribution after run finalization without waiting on locked rows", async () => {
+    const { agentId, commentId, runId } =
+      await seedRunLogAttributionFixture();
+
+    const lockingDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    const lockAcquired = deferred<void>();
+    const releaseLock = deferred<void>();
+    const lockPromise = lockingDb.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT ${issueComments.id} FROM ${issueComments} WHERE ${issueComments.id} = ${commentId} FOR UPDATE`,
+      );
+      lockAcquired.resolve();
+      await releaseLock.promise;
+    });
+
+    await lockAcquired.promise;
+    try {
+      const startedAt = performance.now();
+      await expect(
+        svc.persistRunLogCommentAttribution(runId),
+      ).resolves.toBe(0);
+      expect(performance.now() - startedAt).toBeLessThan(1_500);
+    } finally {
+      releaseLock.resolve();
+      await lockPromise;
+    }
 
     await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(1);
 
@@ -2790,6 +2865,38 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       derivedCreatedByRunId: runId,
       derivedAuthorSource: "run_log_comment_post",
     });
+  });
+
+  it("does not persist a run-log marker for a comment on another issue", async () => {
+    const { commentId, runId } = await seedRunLogAttributionFixture({
+      commentOnDifferentIssue: true,
+    });
+
+    await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(0);
+    const stored = await db
+      .select({ derivedAuthorAgentId: issueComments.derivedAuthorAgentId })
+      .from(issueComments)
+      .where(eq(issueComments.id, commentId))
+      .then((rows) => rows[0] ?? null);
+    expect(stored?.derivedAuthorAgentId).toBeNull();
+  });
+
+  it("does not override direct run attribution with a run-log marker", async () => {
+    const { commentId, runId } = await seedRunLogAttributionFixture({
+      directCreatedByRunId: true,
+    });
+
+    await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(0);
+    const stored = await db
+      .select({
+        createdByRunId: issueComments.createdByRunId,
+        derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+      })
+      .from(issueComments)
+      .where(eq(issueComments.id, commentId))
+      .then((rows) => rows[0] ?? null);
+    expect(stored?.createdByRunId).not.toBeNull();
+    expect(stored?.derivedAuthorAgentId).toBeNull();
   });
 
   it("lists user comments when a candidate attribution run log is missing", async () => {

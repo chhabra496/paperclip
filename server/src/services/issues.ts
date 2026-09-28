@@ -13,6 +13,7 @@ import {
   asc,
   desc,
   eq,
+  exists,
   gt,
   getTableColumns,
   gte,
@@ -7028,6 +7029,7 @@ export function issueService(db: Db) {
         runId: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
         finishedAt: heartbeatRuns.finishedAt,
@@ -7039,6 +7041,11 @@ export function issueService(db: Db) {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run?.finishedAt || !run.logRef || !run.logBytes) return 0;
+
+    const issueId =
+      readStringFromRecord(run.contextSnapshot, "issueId") ??
+      readStringFromRecord(run.contextSnapshot, "taskId");
+    if (!issueId) return 0;
 
     const logContent = await readRunLogText(run);
     const markedCommentIds = [
@@ -7063,12 +7070,29 @@ export function issueService(db: Db) {
       .where(
         and(
           eq(issueComments.companyId, run.companyId),
+          eq(issueComments.issueId, issueId),
           inArray(issueComments.id, markedCommentIds),
           isNull(issueComments.authorAgentId),
+          isNull(issueComments.createdByRunId),
           isNull(issueComments.derivedAuthorAgentId),
           isNotNull(issueComments.authorUserId),
           gte(issueComments.createdAt, runStartedAt),
           lte(issueComments.createdAt, runAttributionEnd),
+          exists(
+            db
+              .select({ id: activityLog.id })
+              .from(activityLog)
+              .where(
+                and(
+                  eq(activityLog.companyId, run.companyId),
+                  eq(activityLog.runId, run.runId),
+                  eq(activityLog.action, "issue.comment_added"),
+                  eq(activityLog.entityType, "issue"),
+                  eq(activityLog.entityId, issueId),
+                  sql`${activityLog.details} ->> 'commentId' = ${issueComments.id}::text`,
+                ),
+              ),
+          ),
         ),
       );
     if (candidates.length === 0) return 0;
@@ -7102,22 +7126,33 @@ export function issueService(db: Db) {
       .map((comment) => comment.id);
     if (eligibleCommentIds.length === 0) return 0;
 
-    return db
-      .update(issueComments)
-      .set({
-        derivedAuthorAgentId: run.agentId,
-        derivedCreatedByRunId: run.runId,
-        derivedAuthorSource: "run_log_comment_post",
-      })
-      .where(
-        and(
-          inArray(issueComments.id, eligibleCommentIds),
-          isNull(issueComments.authorAgentId),
-          isNull(issueComments.derivedAuthorAgentId),
-        ),
-      )
-      .returning({ id: issueComments.id })
-      .then((rows) => rows.length);
+    return db.transaction(async (tx) => {
+      const unlockedCommentIds = await tx
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            inArray(issueComments.id, eligibleCommentIds),
+            isNull(issueComments.authorAgentId),
+            isNull(issueComments.createdByRunId),
+            isNull(issueComments.derivedAuthorAgentId),
+          ),
+        )
+        .for("update", { skipLocked: true })
+        .then((rows) => rows.map((row) => row.id));
+      if (unlockedCommentIds.length === 0) return 0;
+
+      return tx
+        .update(issueComments)
+        .set({
+          derivedAuthorAgentId: run.agentId,
+          derivedCreatedByRunId: run.runId,
+          derivedAuthorSource: "run_log_comment_post",
+        })
+        .where(inArray(issueComments.id, unlockedCommentIds))
+        .returning({ id: issueComments.id })
+        .then((rows) => rows.length);
+    });
   }
 
   async function isTreeHoldInteractionCheckoutAllowed(
