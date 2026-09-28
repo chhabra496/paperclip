@@ -24989,6 +24989,14 @@ export function heartbeatService(
 
         const finalizedRun = persistedRun ?? (await getRun(run.id));
         if (finalizedRun) {
+          try {
+            await issuesSvc.persistRunLogCommentAttribution(finalizedRun.id);
+          } catch (err) {
+            logger.warn(
+              { err, runId: finalizedRun.id },
+              "failed to persist run-log comment attribution after heartbeat finalization",
+            );
+          }
           await appendRunEvent(finalizedRun, {
             eventType: "lifecycle",
             stream: "system",

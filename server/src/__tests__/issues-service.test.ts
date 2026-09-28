@@ -36,6 +36,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { getRunLogStore } from "../services/run-log-store.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
@@ -2707,6 +2708,88 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       releaseLock.resolve();
       await lockPromise;
     }
+  });
+
+  it("persists run-log-only attribution after run finalization", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RunLogAttributionAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Run-log attribution issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const runLogStore = getRunLogStore();
+    const logHandle = await runLogStore.begin({ companyId, agentId, runId });
+    await runLogStore.append(logHandle, {
+      stream: "system",
+      chunk: `comment id: ${commentId}\n`,
+      ts: "2026-05-12T23:00:01.000Z",
+    });
+    const logSummary = await runLogStore.finalize(logHandle);
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      contextSnapshot: { issueId },
+      createdAt: new Date("2026-05-12T22:58:00.000Z"),
+      startedAt: new Date("2026-05-12T22:58:00.000Z"),
+      finishedAt: new Date("2026-05-12T23:14:00.000Z"),
+      logStore: logHandle.store,
+      logRef: logHandle.logRef,
+      logBytes: logSummary.bytes,
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      body: "Legacy agent comment",
+      createdAt: new Date("2026-05-12T23:00:00.000Z"),
+      updatedAt: new Date("2026-05-12T23:00:00.000Z"),
+    });
+
+    await expect(svc.persistRunLogCommentAttribution(runId)).resolves.toBe(1);
+
+    const stored = await db
+      .select({
+        derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+        derivedCreatedByRunId: issueComments.derivedCreatedByRunId,
+        derivedAuthorSource: issueComments.derivedAuthorSource,
+      })
+      .from(issueComments)
+      .where(eq(issueComments.id, commentId))
+      .then((rows) => rows[0] ?? null);
+    expect(stored).toEqual({
+      derivedAuthorAgentId: agentId,
+      derivedCreatedByRunId: runId,
+      derivedAuthorSource: "run_log_comment_post",
+    });
   });
 
   it("lists user comments when a candidate attribution run log is missing", async () => {

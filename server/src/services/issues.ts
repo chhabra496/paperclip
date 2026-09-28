@@ -21,6 +21,7 @@ import {
   isNull,
   like,
   lt,
+  lte,
   ne,
   notExists,
   notInArray,
@@ -231,6 +232,8 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const ISSUE_COMMENT_RUN_LOG_POST_MARKER =
+  /comment id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/gi;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS =
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -7019,6 +7022,104 @@ export function issueService(db: Db) {
     });
   }
 
+  async function persistRunLogCommentAttribution(runId: string) {
+    const run = await db
+      .select({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
+        logStore: heartbeatRuns.logStore,
+        logRef: heartbeatRuns.logRef,
+        logBytes: heartbeatRuns.logBytes,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run?.finishedAt || !run.logRef || !run.logBytes) return 0;
+
+    const logContent = await readRunLogText(run);
+    const markedCommentIds = [
+      ...new Set(
+        [...logContent.matchAll(ISSUE_COMMENT_RUN_LOG_POST_MARKER)].map(
+          (match) => match[1]!.toLowerCase(),
+        ),
+      ),
+    ];
+    if (markedCommentIds.length === 0) return 0;
+
+    const runStartedAt = run.startedAt ?? run.createdAt;
+    const runAttributionEnd = new Date(
+      run.finishedAt.getTime() + ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS,
+    );
+    const candidates = await db
+      .select({
+        id: issueComments.id,
+        authorUserId: issueComments.authorUserId,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, run.companyId),
+          inArray(issueComments.id, markedCommentIds),
+          isNull(issueComments.authorAgentId),
+          isNull(issueComments.derivedAuthorAgentId),
+          isNotNull(issueComments.authorUserId),
+          gte(issueComments.createdAt, runStartedAt),
+          lte(issueComments.createdAt, runAttributionEnd),
+        ),
+      );
+    if (candidates.length === 0) return 0;
+
+    const nonSentinelAuthorUserIds = [
+      ...new Set(
+        candidates
+          .map((comment) => comment.authorUserId)
+          .filter(
+            (id): id is string =>
+              !!id && !NON_HUMAN_SENTINEL_AUTHOR_USER_IDS.has(id),
+          ),
+      ),
+    ];
+    const genuineUserIds = nonSentinelAuthorUserIds.length
+      ? new Set(
+          (
+            await db
+              .select({ id: authUsers.id })
+              .from(authUsers)
+              .where(inArray(authUsers.id, nonSentinelAuthorUserIds))
+          ).map((row) => row.id),
+        )
+      : new Set<string>();
+    const eligibleCommentIds = candidates
+      .filter(
+        (comment) =>
+          NON_HUMAN_SENTINEL_AUTHOR_USER_IDS.has(comment.authorUserId!) ||
+          !genuineUserIds.has(comment.authorUserId!),
+      )
+      .map((comment) => comment.id);
+    if (eligibleCommentIds.length === 0) return 0;
+
+    return db
+      .update(issueComments)
+      .set({
+        derivedAuthorAgentId: run.agentId,
+        derivedCreatedByRunId: run.runId,
+        derivedAuthorSource: "run_log_comment_post",
+      })
+      .where(
+        and(
+          inArray(issueComments.id, eligibleCommentIds),
+          isNull(issueComments.authorAgentId),
+          isNull(issueComments.derivedAuthorAgentId),
+        ),
+      )
+      .returning({ id: issueComments.id })
+      .then((rows) => rows.length);
+  }
+
   async function isTreeHoldInteractionCheckoutAllowed(
     companyId: string,
     checkoutRunId: string | null,
@@ -11834,6 +11935,8 @@ export function issueService(db: Db) {
         .where(eq(labels.id, id))
         .returning()
         .then((rows) => rows[0] ?? null),
+
+    persistRunLogCommentAttribution,
 
     listComments: async (
       issueId: string,
